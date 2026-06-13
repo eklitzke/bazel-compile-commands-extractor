@@ -146,6 +146,11 @@ def _get_bazel_cached_action_keys():
             action_keys.add(line[12:]) # Remainder after actionKey =
         elif line.startswith('Action cache (0 records):'):
             marked_as_empty = True
+        else:
+            # Parse newer Bazel format: "  <number> -> <output path>"
+            match = re.match(r'^\s*\d+\s*->\s*(.+)$', line)
+            if match:
+                action_keys.add(match.group(1).strip())
 
     # Make sure we get notified of changes to the format, since bazel dump --action_cache isn't public API.
     # We continue gracefully, rather than asserting, because we can (conservatively) continue without hitting cache.
@@ -232,7 +237,7 @@ def _is_nvcc(path: str):
     return os.path.basename(path).startswith('nvcc')
 
 
-def _get_headers_gcc(compile_action, source_path: str, action_key: str):
+def _get_headers_gcc(compile_action, source_path: str, action_key: str, output_file: typing.Optional[str] = None):
     """Gets the headers used by a particular compile command that uses gcc arguments formatting (including clang.)
 
     Relatively slow. Requires running the C preprocessor if we can't hit Bazel's cache.
@@ -240,7 +245,8 @@ def _get_headers_gcc(compile_action, source_path: str, action_key: str):
     # Flags reference here: https://clang.llvm.org/docs/ClangCommandLineReference.html
 
     # Check to see if Bazel has an (approximately) fresh cache of the included headers, and if so, use them to avoid a slow preprocessing step.
-    if action_key in _get_bazel_cached_action_keys():  # Safe because Bazel only holds one cached action key per path, and the key contains the path.
+    bazel_cached_keys = _get_bazel_cached_action_keys()
+    if action_key in bazel_cached_keys or (output_file and output_file in bazel_cached_keys):  # Safe because Bazel only holds one cached action key per path, and the key contains the path.
         for i, arg in enumerate(compile_action.arguments):
             if arg.startswith('-MF'):
                 if len(arg) > 3: # Either appended, like -MF<file>
@@ -588,7 +594,7 @@ def _get_headers(compile_action, source_path: str):
     if compile_action.arguments[0].endswith('cl.exe'): # cl.exe and also clang-cl.exe
         headers, should_cache = _get_headers_msvc(compile_action, source_path)
     else:
-        headers, should_cache = _get_headers_gcc(compile_action, source_path, compile_action.actionKey)
+        headers, should_cache = _get_headers_gcc(compile_action, source_path, compile_action.actionKey, output_file)
 
     # Cache for future use
     if output_file and should_cache:
@@ -617,6 +623,12 @@ def _get_files(compile_action):
 
     # First, we do the obvious thing: Filter args to those that look like source files.
     source_file_candidates = [arg for arg in compile_action.arguments if not arg.startswith('-') and arg.endswith(_get_files.source_extensions)]
+    valid_extensions = _get_files.source_extensions
+    if not source_file_candidates:
+        # Fall back to headers if this is a header compile action (e.g. layering_check)
+        header_extensions = ('.h', '.hh', '.hpp', '.hxx', '.h++', '.H')
+        source_file_candidates = [arg for arg in compile_action.arguments if not arg.startswith('-') and arg.endswith(header_extensions)]
+        valid_extensions = header_extensions
     assert source_file_candidates, f"No source files found in compile args: {compile_action.arguments}.\nPlease file an issue with this information!"
     source_file = source_file_candidates[0]
 
@@ -644,7 +656,7 @@ def _get_files(compile_action):
             source_index = compile_action.arguments.index('/c') + 1
 
         source_file = compile_action.arguments[source_index]
-        assert source_file.endswith(_get_files.source_extensions), f"Source file candidate, {source_file}, seems to be wrong.\nSelected from {compile_action.arguments}.\nPlease file an issue with this information!"
+        assert source_file.endswith(valid_extensions), f"Source file candidate, {source_file}, seems to be wrong.\nSelected from {compile_action.arguments}.\nPlease file an issue with this information!"
 
     # Warn gently about missing files
     if not os.path.isfile(source_file):
@@ -668,6 +680,10 @@ def _get_files(compile_action):
 
     # Assembly sources that are not preprocessed can't include headers
     if os.path.splitext(source_file)[1] in _get_files.assembly_source_extensions:
+        return {source_file}, set()
+
+    # Header compilation actions (e.g. compiling a header file directly)
+    if os.path.splitext(source_file)[1] in ('.h', '.hh', '.hpp', '.hxx', '.h++', '.H'):
         return {source_file}, set()
 
     header_files = _get_headers(compile_action, source_file)
